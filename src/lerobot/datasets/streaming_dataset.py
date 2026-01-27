@@ -308,13 +308,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         # Get episode index from the item
         ep_idx = item["episode_index"]
 
-        # "timestamp" restarts from 0 for each episode, whereas we need a global timestep within the single .mp4 file (given by index/fps)
-        current_ts = item["index"] / self.fps
+        # Use the per-episode timestamp - video offset is handled in _query_videos
+        current_ts = item["timestamp"]
 
+        # Episode boundaries should be RELATIVE (0 to duration) since current_ts is relative.
+        # The from_timestamp offset is added later in _query_videos when seeking into the video file.
         episode_boundaries_ts = {
             key: (
-                self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
-                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
+                0.0,  # Episode always starts at relative time 0
+                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"]
+                - self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],  # duration
             )
             for key in self.meta.video_keys
         }
@@ -384,13 +387,19 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         Segmentation Fault. This probably happens because a memory reference to the video loader is created in
         the main process and a subprocess fails to access it.
         """
-
+        ep = self.meta.episodes[ep_idx]
         item = {}
         for video_key, query_ts in query_timestamps.items():
+            # Episodes are stored sequentially on a single mp4 to reduce the number of files.
+            # Thus we load the start timestamp of the episode on this mp4 and,
+            # shift the query timestamp accordingly.
+            from_timestamp = ep[f"videos/{video_key}/from_timestamp"]
+            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+
             root = self.meta.url_root if self.streaming and not self.streaming_from_local else self.root
             video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
             frames = decode_video_frames_torchcodec(
-                video_path, query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
+                video_path, shifted_query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
             )
 
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
