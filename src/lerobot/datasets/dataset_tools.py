@@ -21,12 +21,16 @@ This module provides utilities for:
 - Splitting datasets into multiple smaller datasets
 - Adding/removing features from datasets
 - Merging datasets (wrapper around aggregate functionality)
+- Shuffling episode order in datasets
 """
 
 import logging
+import random
 import shutil
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from fractions import Fraction
 from pathlib import Path
 
 import datasets
@@ -54,6 +58,62 @@ from lerobot.datasets.utils import (
 )
 from lerobot.datasets.video_utils import encode_video_frames, get_video_info
 from lerobot.utils.constants import HF_LEROBOT_HOME, OBS_IMAGE
+
+
+def update_info_with_data_files(
+    dataset_path: str | Path,
+    write: bool = True,
+) -> list[str]:
+    """Update meta/info.json to include a list of all parquet data files.
+
+    This scans the data/ directory for parquet files and adds a `data_files` list
+    to info.json. This enables efficient dataset loading without needing to scan
+    directories at runtime (useful for remote storage like S3).
+
+    Args:
+        dataset_path: Path to the dataset directory (local path).
+        write: If True, writes the updated info.json. If False, just returns the list.
+
+    Returns:
+        List of parquet file paths relative to the dataset root.
+
+    Example:
+        >>> from lerobot.datasets.dataset_tools import update_info_with_data_files
+        >>> data_files = update_info_with_data_files("/path/to/dataset")
+        >>> print(data_files)
+        ['data/chunk-000/file-000.parquet', 'data/chunk-000/file-001.parquet']
+    """
+    import json
+    from pathlib import Path
+
+    dataset_path = Path(dataset_path)
+    info_path = dataset_path / "meta" / "info.json"
+
+    if not info_path.exists():
+        raise FileNotFoundError(f"info.json not found at {info_path}")
+
+    # Load info.json
+    with open(info_path, "r") as f:
+        info = json.load(f)
+
+    # Scan the data directory for parquet files
+    data_dir = dataset_path / "data"
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data directory not found at {data_dir}")
+
+    data_files = []
+    for parquet_file in sorted(data_dir.glob("*/*.parquet")):
+        rel_path = str(parquet_file.relative_to(dataset_path))
+        data_files.append(rel_path)
+
+    if write:
+        # Update info.json with data_files list
+        info["data_files"] = data_files
+        with open(info_path, "w") as f:
+            json.dump(info, f, indent=4)
+        logging.info(f"Updated {info_path} with {len(data_files)} data files")
+
+    return data_files
 
 
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
@@ -270,6 +330,235 @@ def merge_datasets(
     )
 
     return merged_dataset
+
+
+def shuffle_episodes(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    seed: int | None = None,
+) -> LeRobotDataset:
+    """Shuffle the order of episodes in a LeRobotDataset.
+
+    This physically reorders episodes in both parquet and video files, ensuring
+    optimal streaming performance where sequential episode reads map to
+    sequential file access. Videos are re-encoded with episodes in the new
+    shuffled order.
+
+    This is useful for datasets with multiple tasks where episodes are grouped
+    by task, and you want to interleave episodes from different tasks.
+
+    Args:
+        dataset: The source LeRobotDataset.
+        output_dir: Directory to save the new dataset. If None, uses default location.
+        repo_id: Repository ID for the new dataset. If None, appends "_shuffled" to original.
+        seed: Random seed for reproducibility. If None, uses random shuffling.
+
+    Returns:
+        New dataset with shuffled episode order.
+
+    Example:
+        >>> from lerobot.datasets import LeRobotDataset
+        >>> from lerobot.datasets.dataset_tools import shuffle_episodes
+        >>>
+        >>> dataset = LeRobotDataset(repo_id="my_dataset", root="/path/to/dataset")
+        >>> shuffled = shuffle_episodes(dataset, seed=42)
+        >>> shuffled.push_to_hub()
+    """
+    if dataset.meta.total_episodes < 2:
+        raise ValueError("Dataset must have at least 2 episodes to shuffle")
+
+    logging.info(f"Shuffling {dataset.meta.total_episodes} episodes from dataset {dataset.repo_id}")
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_shuffled"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # Generate shuffled episode indices
+    episode_indices = list(range(dataset.meta.total_episodes))
+    if seed is not None:
+        random.seed(seed)
+    random.shuffle(episode_indices)
+
+    # Create episode_mapping: old_idx -> new_idx
+    # episode_indices[new_idx] = old_idx, so we need to invert
+    episode_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(episode_indices)}
+
+    logging.info(f"Episode order: first 5 new episodes come from original episodes {episode_indices[:5]}")
+
+    # Create new metadata
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=dataset.meta.features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(dataset.meta.video_keys) > 0,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Re-encode videos with episodes in new order (if dataset has videos)
+    video_metadata = None
+    if dataset.meta.video_keys:
+        logging.info("Re-encoding videos with shuffled episode order...")
+        video_metadata = _shuffle_and_reencode_videos(dataset, new_meta, episode_mapping)
+
+        # Copy and reindex parquet data files aligned with video files
+        logging.info("Copying and reindexing data files (aligned with videos)...")
+        data_metadata = _copy_and_reindex_data_aligned_with_videos(
+            dataset, new_meta, episode_mapping, video_metadata
+        )
+    else:
+        # No videos - use standard data copying
+        logging.info("Copying and reindexing data files...")
+        data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
+
+    # Copy and reindex episodes metadata
+    logging.info("Copying episodes metadata...")
+    if video_metadata:
+        # Use aligned function to ensure meta/episodes files match data/video files
+        _copy_and_reindex_episodes_metadata_aligned(
+            dataset, new_meta, episode_mapping, data_metadata, video_metadata
+        )
+    else:
+        _copy_and_reindex_episodes_metadata(dataset, new_meta, episode_mapping, data_metadata, video_metadata)
+
+    # Load and return the new dataset
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+    logging.info(f"Created shuffled dataset with {new_dataset.meta.total_episodes} episodes")
+    return new_dataset
+
+
+def realign_parquets_to_videos(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    copy_videos: bool = True,
+) -> LeRobotDataset:
+    """Realign parquet files (data and meta/episodes) to match video file structure.
+
+    This function ensures that parquet files have 1:1 correspondence with video files
+    WITHOUT re-encoding videos. It:
+    1. Optionally copies videos as-is (no re-encoding)
+    2. Reads video metadata from the source dataset
+    3. Rewrites data parquet files aligned with video files
+    4. Rewrites episode metadata parquet files aligned with video files
+
+    This is useful when you have a dataset where the parquet files don't match
+    the video file structure and you want to optimize for streaming.
+
+    Args:
+        dataset: The source LeRobotDataset.
+        output_dir: Directory to save the new dataset. If None, uses default location.
+        repo_id: Repository ID for the new dataset. If None, appends "_aligned" to original.
+        copy_videos: If True, copy video files to output. If False, assume videos are
+                    already in place at output_dir.
+
+    Returns:
+        New dataset with parquet files aligned to video structure.
+
+    Example:
+        >>> dataset = LeRobotDataset(repo_id="my_dataset", root="/path/to/dataset")
+        >>> aligned = realign_parquets_to_videos(dataset, output_dir="/path/to/output")
+    """
+    if not dataset.meta.video_keys:
+        raise ValueError("Dataset must have videos to realign parquets")
+
+    logging.info(f"Realigning parquets to videos for dataset {dataset.repo_id}")
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_aligned"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    # Identity mapping - no shuffling
+    episode_mapping = {i: i for i in range(dataset.meta.total_episodes)}
+
+    # Create new metadata
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=dataset.meta.features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    # Copy videos and build video metadata from source
+    video_metadata: dict[int, dict] = {i: {} for i in range(dataset.meta.total_episodes)}
+
+    for video_key in dataset.meta.video_keys:
+        logging.info(f"Processing videos for {video_key}")
+
+        # Track which video files we've copied
+        copied_files: set[tuple[int, int]] = set()
+
+        for ep_idx in range(dataset.meta.total_episodes):
+            src_ep = dataset.meta.episodes[ep_idx]
+
+            # Get video file info from source
+            chunk_idx = src_ep[f"videos/{video_key}/chunk_index"]
+            file_idx = src_ep[f"videos/{video_key}/file_index"]
+            from_ts = src_ep[f"videos/{video_key}/from_timestamp"]
+            to_ts = src_ep[f"videos/{video_key}/to_timestamp"]
+
+            # Copy video file if not already copied
+            file_key = (chunk_idx, file_idx)
+            if copy_videos and file_key not in copied_files:
+                src_path = dataset.root / dataset.meta.video_path.format(
+                    video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+                )
+                dst_path = output_dir / new_meta.video_path.format(
+                    video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+                )
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(src_path, dst_path)
+                copied_files.add(file_key)
+
+            # Store video metadata (same as source)
+            video_metadata[ep_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
+            video_metadata[ep_idx][f"videos/{video_key}/file_index"] = file_idx
+            video_metadata[ep_idx][f"videos/{video_key}/from_timestamp"] = from_ts
+            video_metadata[ep_idx][f"videos/{video_key}/to_timestamp"] = to_ts
+
+        # Update video info in metadata
+        if video_key in dataset.meta.features and dataset.meta.features[video_key].get("info"):
+            new_meta.info["features"][video_key]["info"] = dataset.meta.features[video_key]["info"]
+
+    # Copy and reindex parquet data files aligned with video files
+    logging.info("Writing data parquets aligned with videos...")
+    data_metadata = _copy_and_reindex_data_aligned_with_videos(
+        dataset, new_meta, episode_mapping, video_metadata
+    )
+
+    # Copy and reindex episodes metadata aligned with data/video files
+    logging.info("Writing episodes metadata aligned with videos...")
+    _copy_and_reindex_episodes_metadata_aligned(
+        dataset, new_meta, episode_mapping, data_metadata, video_metadata
+    )
+
+    # Load and return the new dataset
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+
+    logging.info(f"Created aligned dataset with {new_dataset.meta.total_episodes} episodes")
+    return new_dataset
 
 
 def modify_features(
@@ -564,6 +853,127 @@ def _copy_and_reindex_data(
     return episode_data_metadata
 
 
+def _copy_and_reindex_data_aligned_with_videos(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    episode_mapping: dict[int, int],
+    video_metadata: dict[int, dict],
+) -> dict[int, dict]:
+    """Copy and reindex data files, aligning parquet files with video files.
+
+    This function ensures that parquet data files have a 1:1 correspondence with
+    video files - each parquet file contains exactly the episodes that are in the
+    corresponding video file. This is optimal for streaming because metadata and
+    video data are co-located with the same chunk/file indices.
+
+    Args:
+        src_dataset: Source dataset to copy from
+        dst_meta: Destination metadata object
+        episode_mapping: Mapping from old episode indices to new indices
+        video_metadata: Dict mapping new episode index to its video metadata
+                       (must contain videos/{key}/chunk_index and videos/{key}/file_index)
+
+    Returns:
+        dict mapping new episode index to its data file metadata (chunk_index, file_index, etc.)
+    """
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    # Get the first video key to determine file structure
+    # All video keys should have the same episode-to-file mapping
+    if not dst_meta.video_keys:
+        raise ValueError("video_metadata provided but no video keys in destination metadata")
+
+    first_video_key = dst_meta.video_keys[0]
+
+    # Group new episodes by their video file location
+    file_to_new_episodes: dict[tuple[int, int], list[int]] = {}
+    for new_idx, vid_meta in video_metadata.items():
+        chunk_idx = vid_meta[f"videos/{first_video_key}/chunk_index"]
+        file_idx = vid_meta[f"videos/{first_video_key}/file_index"]
+        file_key = (chunk_idx, file_idx)
+        if file_key not in file_to_new_episodes:
+            file_to_new_episodes[file_key] = []
+        file_to_new_episodes[file_key].append(new_idx)
+
+    # Sort episodes within each file
+    for file_key in file_to_new_episodes:
+        file_to_new_episodes[file_key].sort()
+
+    # Create reverse mapping: new_idx -> old_idx
+    reverse_mapping = {new_idx: old_idx for old_idx, new_idx in episode_mapping.items()}
+
+    # Setup task mapping
+    if dst_meta.tasks is None:
+        all_task_indices = set()
+        for old_idx in episode_mapping:
+            src_ep = src_dataset.meta.episodes[old_idx]
+            # Get task indices from the source data
+            file_path = src_dataset.meta.get_data_file_path(old_idx)
+            df = pd.read_parquet(src_dataset.root / file_path)
+            ep_df = df[df["episode_index"] == old_idx]
+            all_task_indices.update(ep_df["task_index"].unique().tolist())
+        tasks = [src_dataset.meta.tasks.iloc[idx].name for idx in all_task_indices]
+        dst_meta.save_episode_tasks(list(set(tasks)))
+
+    task_mapping = {}
+    for old_task_idx in range(len(src_dataset.meta.tasks)):
+        task_name = src_dataset.meta.tasks.iloc[old_task_idx].name
+        new_task_idx = dst_meta.get_task_index(task_name)
+        if new_task_idx is not None:
+            task_mapping[old_task_idx] = new_task_idx
+
+    global_index = 0
+    episode_data_metadata: dict[int, dict] = {}
+
+    # Process each video file group
+    for (chunk_idx, file_idx), new_episodes in tqdm(
+        sorted(file_to_new_episodes.items()), desc="Writing aligned data files"
+    ):
+        # Collect all frames for episodes in this file
+        all_frames = []
+
+        for new_idx in new_episodes:
+            old_idx = reverse_mapping[new_idx]
+
+            # Load source data for this episode
+            src_file_path = src_dataset.meta.get_data_file_path(old_idx)
+            src_df = pd.read_parquet(src_dataset.root / src_file_path)
+            ep_df = src_df[src_df["episode_index"] == old_idx].copy()
+
+            # Update indices
+            ep_df["episode_index"] = new_idx
+            ep_df["task_index"] = ep_df["task_index"].replace(task_mapping)
+
+            all_frames.append(ep_df)
+
+        # Concatenate all frames for this file
+        df = pd.concat(all_frames, ignore_index=True)
+
+        # Assign global indices
+        df["index"] = range(global_index, global_index + len(df))
+
+        # Write to parquet file with same chunk/file as video
+        dst_path = dst_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        _write_parquet(df, dst_path, dst_meta)
+
+        # Record metadata for each episode
+        for new_idx in new_episodes:
+            ep_df = df[df["episode_index"] == new_idx]
+            episode_data_metadata[new_idx] = {
+                "data/chunk_index": chunk_idx,
+                "data/file_index": file_idx,
+                "dataset_from_index": int(ep_df["index"].min()),
+                "dataset_to_index": int(ep_df["index"].max() + 1),
+            }
+
+        global_index += len(df)
+
+    return episode_data_metadata
+
+
 def _keep_episodes_from_video_with_av(
     input_path: Path,
     output_path: Path,
@@ -801,6 +1211,245 @@ def _copy_and_reindex_videos(
     return episodes_video_metadata
 
 
+def _shuffle_and_reencode_videos(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    episode_mapping: dict[int, int],
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+) -> dict[int, dict]:
+    """Re-encode videos with episodes in shuffled order for optimal streaming.
+
+    Unlike _copy_and_reindex_videos which preserves video file structure, this function
+    re-encodes ALL videos so that episodes appear in their new shuffled order within
+    the video files. This ensures sequential episode reads map to sequential bytes
+    in the video files, which is critical for streaming performance.
+
+    Args:
+        src_dataset: Source dataset to copy from
+        dst_meta: Destination metadata object
+        episode_mapping: Mapping from old episode indices to new indices
+        vcodec: Video codec to use for encoding
+        pix_fmt: Pixel format for output video
+
+    Returns:
+        dict mapping new episode index to its video metadata (chunk_index, file_index, timestamps)
+    """
+    import av
+
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    if dst_meta.video_path is None:
+        raise ValueError("Destination metadata has no video_path defined")
+
+    # Create reverse mapping: new_idx -> old_idx
+    reverse_mapping = {new_idx: old_idx for old_idx, new_idx in episode_mapping.items()}
+    total_new_episodes = len(reverse_mapping)
+
+    episodes_video_metadata: dict[int, dict] = {new_idx: {} for new_idx in range(total_new_episodes)}
+
+    # Pre-calculate file boundaries based on source video sizes
+    # Use the video key with the largest files (most conservative estimate)
+    total_duration = src_dataset.meta.total_frames / src_dataset.meta.fps
+    max_mb_per_second = 0.0
+    for video_key in src_dataset.meta.video_keys:
+        total_src_size_mb = sum(
+            f.stat().st_size for f in (src_dataset.root / "videos" / video_key).rglob("*.mp4")
+        ) / (1024 * 1024)
+        mb_per_second = total_src_size_mb / total_duration if total_duration > 0 else 0.5
+        max_mb_per_second = max(max_mb_per_second, mb_per_second)
+        logging.info(f"Video {video_key}: {total_src_size_mb:.1f} MB total, {mb_per_second:.3f} MB/s")
+
+    logging.info(f"Using {max_mb_per_second:.3f} MB/s for file boundary estimation")
+
+    # Calculate file assignments for each episode based on cumulative size
+    episode_file_assignments: dict[int, tuple[int, int]] = {}
+    chunk_idx, file_idx = 0, 0
+    cumulative_size_mb = 0.0
+
+    for new_idx in range(total_new_episodes):
+        old_idx = reverse_mapping[new_idx]
+        src_ep = src_dataset.meta.episodes[old_idx]
+        # Get duration from any video key (they should all have same duration)
+        first_video_key = src_dataset.meta.video_keys[0]
+        src_from_ts = src_ep[f"videos/{first_video_key}/from_timestamp"]
+        src_to_ts = src_ep[f"videos/{first_video_key}/to_timestamp"]
+        ep_duration = src_to_ts - src_from_ts
+        ep_size_estimate = ep_duration * max_mb_per_second
+
+        # Check if adding this episode would exceed the limit
+        if cumulative_size_mb + ep_size_estimate >= dst_meta.video_files_size_in_mb and new_idx > 0:
+            chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, dst_meta.chunks_size)
+            cumulative_size_mb = 0.0
+
+        episode_file_assignments[new_idx] = (chunk_idx, file_idx)
+        cumulative_size_mb += ep_size_estimate
+
+    logging.info(f"Pre-calculated file assignments: {max(f for _, f in episode_file_assignments.values()) + 1} files")
+
+    for video_key in src_dataset.meta.video_keys:
+        logging.info(f"Re-encoding videos for {video_key} with shuffled episode order")
+
+        # We'll write episodes in new order (0, 1, 2, ...) to sequential video files
+        chunk_idx = 0
+        file_idx = 0
+        cumulative_ts = 0.0
+
+        # Open the first output video file
+        dst_video_path = dst_meta.root / dst_meta.video_path.format(
+            video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+        )
+        dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # We need to get video properties from the source
+        # Find any valid source video to get properties
+        first_old_idx = reverse_mapping[0]
+        first_src_ep = src_dataset.meta.episodes[first_old_idx]
+        first_src_chunk = first_src_ep[f"videos/{video_key}/chunk_index"]
+        first_src_file = first_src_ep[f"videos/{video_key}/file_index"]
+        first_src_path = src_dataset.root / src_dataset.meta.video_path.format(
+            video_key=video_key, chunk_index=first_src_chunk, file_index=first_src_file
+        )
+
+        # Get video properties from first source file
+        probe_container = av.open(str(first_src_path))
+        if not probe_container.streams.video:
+            raise ValueError(f"No video streams found in {first_src_path}")
+        v_probe = probe_container.streams.video[0]
+        video_width = v_probe.codec_context.width
+        video_height = v_probe.codec_context.height
+        probe_container.close()
+
+        fps = src_dataset.meta.fps
+        fps_fraction = Fraction(fps).limit_denominator(1000)
+
+        # Initialize output container
+        out_container = av.open(str(dst_video_path), mode="w")
+        v_out = out_container.add_stream(vcodec, rate=fps_fraction)
+        v_out.width = video_width
+        v_out.height = video_height
+        v_out.pix_fmt = pix_fmt
+        v_out.time_base = Fraction(1, int(fps))
+        out_container.start_encoding()
+
+        frame_count = 0
+
+        # Cache for open source containers to avoid reopening
+        src_container_cache: dict[tuple[int, int], av.container.InputContainer] = {}
+
+        for new_idx in tqdm(range(total_new_episodes), desc=f"Re-encoding {video_key}"):
+            # Check if we need to switch to a different file based on pre-calculated assignments
+            assigned_chunk, assigned_file = episode_file_assignments[new_idx]
+            if (assigned_chunk, assigned_file) != (chunk_idx, file_idx):
+                # Need to switch to a different file
+                for pkt in v_out.encode():
+                    out_container.mux(pkt)
+                out_container.close()
+
+                chunk_idx, file_idx = assigned_chunk, assigned_file
+                dst_video_path = dst_meta.root / dst_meta.video_path.format(
+                    video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+                )
+                dst_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+                out_container = av.open(str(dst_video_path), mode="w")
+                v_out = out_container.add_stream(vcodec, rate=fps_fraction)
+                v_out.width = video_width
+                v_out.height = video_height
+                v_out.pix_fmt = pix_fmt
+                v_out.time_base = Fraction(1, int(fps))
+                out_container.start_encoding()
+
+                frame_count = 0
+                cumulative_ts = 0.0
+
+            old_idx = reverse_mapping[new_idx]
+            src_ep = src_dataset.meta.episodes[old_idx]
+
+            # Get source video file info
+            src_chunk = src_ep[f"videos/{video_key}/chunk_index"]
+            src_file = src_ep[f"videos/{video_key}/file_index"]
+            src_from_ts = src_ep[f"videos/{video_key}/from_timestamp"]
+            src_to_ts = src_ep[f"videos/{video_key}/to_timestamp"]
+
+            # Record metadata for this episode
+            episode_start_ts = cumulative_ts
+            episodes_video_metadata[new_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
+            episodes_video_metadata[new_idx][f"videos/{video_key}/file_index"] = file_idx
+            episodes_video_metadata[new_idx][f"videos/{video_key}/from_timestamp"] = episode_start_ts
+
+            # Get or open source container
+            src_key = (src_chunk, src_file)
+            if src_key not in src_container_cache:
+                src_path = src_dataset.root / src_dataset.meta.video_path.format(
+                    video_key=video_key, chunk_index=src_chunk, file_index=src_file
+                )
+                src_container_cache[src_key] = av.open(str(src_path))
+
+            in_container = src_container_cache[src_key]
+            v_in = in_container.streams.video[0]
+
+            # Seek to start of episode
+            # Convert timestamp to stream time_base units for seeking
+            seek_ts = int(src_from_ts / float(v_in.time_base))
+            in_container.seek(seek_ts, stream=v_in)
+
+            # Extract frames for this episode
+            frame_time = None  # Track last frame time for break condition
+            for packet in in_container.demux(v_in):
+                for frame in packet.decode():
+                    if frame is None:
+                        continue
+
+                    frame_time = float(frame.pts * frame.time_base) if frame.pts is not None else 0.0
+
+                    # Skip frames before our range (can happen after seek)
+                    if frame_time < src_from_ts - 0.001:  # Small tolerance
+                        continue
+
+                    # Stop if we've passed the end of this episode
+                    if frame_time >= src_to_ts - 0.001:
+                        break
+
+                    # Write frame to output
+                    new_frame = frame.reformat(width=v_out.width, height=v_out.height, format=v_out.pix_fmt)
+                    new_frame.pts = frame_count
+                    new_frame.time_base = Fraction(1, int(fps))
+
+                    for pkt in v_out.encode(new_frame):
+                        out_container.mux(pkt)
+
+                    frame_count += 1
+                    cumulative_ts = frame_count / fps
+
+                # Break out of packet loop if we've finished the episode
+                if frame_time is not None and frame_time >= src_to_ts - 0.001:
+                    break
+
+            episodes_video_metadata[new_idx][f"videos/{video_key}/to_timestamp"] = cumulative_ts
+
+        # Flush and close final output file
+        for pkt in v_out.encode():
+            out_container.mux(pkt)
+        out_container.close()
+
+        # Close all cached source containers
+        for container in src_container_cache.values():
+            container.close()
+
+        # Update video info in metadata (from first output file)
+        if dst_meta.info["features"][video_key].get("info") is None:
+            from lerobot.datasets.video_utils import get_video_info
+
+            first_output_path = dst_meta.root / dst_meta.video_path.format(
+                video_key=video_key, chunk_index=0, file_index=0
+            )
+            dst_meta.info["features"][video_key]["info"] = get_video_info(first_output_path)
+
+    return episodes_video_metadata
+
+
 def _copy_and_reindex_episodes_metadata(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
@@ -885,6 +1534,155 @@ def _copy_and_reindex_episodes_metadata(
 
     dst_meta._close_writer()
 
+    dst_meta.info.update(
+        {
+            "total_episodes": len(episode_mapping),
+            "total_frames": total_frames,
+            "total_tasks": len(dst_meta.tasks) if dst_meta.tasks is not None else 0,
+            "splits": {"train": f"0:{len(episode_mapping)}"},
+        }
+    )
+    write_info(dst_meta.info, dst_meta.root)
+
+    if not all_stats:
+        logging.warning("No statistics found to aggregate")
+        return
+
+    logging.info(f"Aggregating statistics for {len(all_stats)} episodes")
+    aggregated_stats = aggregate_stats(all_stats)
+    filtered_stats = {k: v for k, v in aggregated_stats.items() if k in dst_meta.features}
+    write_stats(filtered_stats, dst_meta.root)
+
+
+def _copy_and_reindex_episodes_metadata_aligned(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    episode_mapping: dict[int, int],
+    data_metadata: dict[int, dict],
+    video_metadata: dict[int, dict],
+) -> None:
+    """Copy and reindex episodes metadata, aligning with data/video file structure.
+
+    Unlike _copy_and_reindex_episodes_metadata which uses LeRobotDatasetMetadata's
+    internal file-size based chunking, this function writes episode metadata files
+    with the SAME chunk/file structure as the data files (which are aligned with videos).
+
+    This ensures all three file types have 1:1 correspondence:
+    - meta/episodes/chunk-X/file-Y.parquet
+    - data/chunk-X/file-Y.parquet
+    - videos/.../chunk-X/file-Y.mp4
+
+    Args:
+        src_dataset: Source dataset to copy from
+        dst_meta: Destination metadata object
+        episode_mapping: Mapping from old episode indices to new indices
+        data_metadata: Dict mapping new episode index to its data file metadata
+                      (must contain data/chunk_index and data/file_index)
+        video_metadata: Dict mapping new episode index to its video metadata
+    """
+    from lerobot.datasets.utils import flatten_dict
+
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    # Group episodes by their data file location (which is aligned with video files)
+    file_to_episodes: dict[tuple[int, int], list[int]] = {}
+    for new_idx, data_meta in data_metadata.items():
+        chunk_idx = data_meta["data/chunk_index"]
+        file_idx = data_meta["data/file_index"]
+        file_key = (chunk_idx, file_idx)
+        if file_key not in file_to_episodes:
+            file_to_episodes[file_key] = []
+        file_to_episodes[file_key].append(new_idx)
+
+    # Sort episodes within each file
+    for file_key in file_to_episodes:
+        file_to_episodes[file_key].sort()
+
+    # Create reverse mapping
+    reverse_mapping = {new_idx: old_idx for old_idx, new_idx in episode_mapping.items()}
+
+    all_stats = []
+    total_frames = 0
+
+    # Process each file group
+    for (chunk_idx, file_idx), new_episodes in tqdm(
+        sorted(file_to_episodes.items()), desc="Writing aligned episodes metadata"
+    ):
+        episode_rows = []
+
+        for new_idx in new_episodes:
+            old_idx = reverse_mapping[new_idx]
+            src_episode_full = _load_episode_with_stats(src_dataset, old_idx)
+            src_episode = src_dataset.meta.episodes[old_idx]
+
+            # Build episode metadata
+            episode_meta = data_metadata[new_idx].copy()
+            if video_metadata and new_idx in video_metadata:
+                episode_meta.update(video_metadata[new_idx])
+
+            # Add meta/episodes chunk/file indices (same as data files)
+            episode_meta["meta/episodes/chunk_index"] = chunk_idx
+            episode_meta["meta/episodes/file_index"] = file_idx
+
+            # Extract episode statistics
+            episode_stats = {}
+            for key in src_episode_full:
+                if key.startswith("stats/"):
+                    stat_key = key.replace("stats/", "")
+                    parts = stat_key.split("/")
+                    if len(parts) == 2:
+                        feature_name, stat_name = parts
+                        if feature_name not in episode_stats:
+                            episode_stats[feature_name] = {}
+
+                        value = src_episode_full[key]
+
+                        if feature_name in src_dataset.meta.features:
+                            feature_dtype = src_dataset.meta.features[feature_name]["dtype"]
+                            if feature_dtype in ["image", "video"] and stat_name != "count":
+                                if isinstance(value, np.ndarray) and value.dtype == object:
+                                    flat_values = []
+                                    for item in value:
+                                        while isinstance(item, np.ndarray):
+                                            item = item.flatten()[0]
+                                        flat_values.append(item)
+                                    value = np.array(flat_values, dtype=np.float64).reshape(3, 1, 1)
+                                elif isinstance(value, np.ndarray) and value.shape == (3,):
+                                    value = value.reshape(3, 1, 1)
+
+                        episode_stats[feature_name][stat_name] = value
+
+            all_stats.append(episode_stats)
+
+            episode_dict = {
+                "episode_index": new_idx,
+                "tasks": src_episode["tasks"],
+                "length": src_episode["length"],
+            }
+            episode_dict.update(episode_meta)
+            episode_dict.update(flatten_dict({"stats": episode_stats}))
+            episode_rows.append(episode_dict)
+
+            total_frames += src_episode["length"]
+
+        # Write all episodes in this file to a single parquet file
+        df = pd.DataFrame(episode_rows)
+
+        # Handle numpy arrays - convert to lists for parquet compatibility
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].apply(
+                    lambda x: x.tolist() if isinstance(x, np.ndarray) else x
+                )
+
+        episodes_path = dst_meta.root / DEFAULT_EPISODES_PATH.format(
+            chunk_index=chunk_idx, file_index=file_idx
+        )
+        episodes_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(episodes_path, engine="pyarrow")
+
+    # Update info
     dst_meta.info.update(
         {
             "total_episodes": len(episode_mapping),
