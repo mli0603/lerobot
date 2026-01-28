@@ -438,6 +438,59 @@ def shuffle_episodes(
     return new_dataset
 
 
+def _validate_video_timestamps_per_file(
+    video_metadata: dict[int, dict],
+    video_key: str,
+    total_episodes: int,
+    tolerance: float = 1.0,
+) -> None:
+    """Validate that from_timestamp resets to near-zero when file_index changes.
+
+    LeRobot v3.0 requires that from_timestamp and to_timestamp represent offsets
+    into the specific video file referenced by (chunk_index, file_index), NOT
+    cumulative offsets across all video files.
+
+    Args:
+        video_metadata: Dict mapping episode index to video metadata
+        video_key: The video key being validated
+        total_episodes: Total number of episodes
+        tolerance: Maximum allowed from_timestamp for the first episode in each video file.
+                   Default 1.0 second allows for small offsets.
+
+    Raises:
+        ValueError: If from_timestamp doesn't reset when file_index changes
+    """
+    # Group episodes by (chunk_index, file_index)
+    file_to_first_episode: dict[tuple[int, int], tuple[int, float]] = {}
+
+    for ep_idx in range(total_episodes):
+        if ep_idx not in video_metadata:
+            continue
+        chunk_idx = video_metadata[ep_idx].get(f"videos/{video_key}/chunk_index")
+        file_idx = video_metadata[ep_idx].get(f"videos/{video_key}/file_index")
+        from_ts = video_metadata[ep_idx].get(f"videos/{video_key}/from_timestamp")
+
+        if chunk_idx is None or file_idx is None or from_ts is None:
+            continue
+
+        file_key = (chunk_idx, file_idx)
+        if file_key not in file_to_first_episode:
+            file_to_first_episode[file_key] = (ep_idx, from_ts)
+
+    # Validate that first episode in each video file has from_timestamp near 0
+    for (chunk_idx, file_idx), (first_ep_idx, first_from_ts) in file_to_first_episode.items():
+        if first_from_ts > tolerance:
+            raise ValueError(
+                f"Video timestamp validation failed for '{video_key}':\n"
+                f"  file_index={file_idx}, chunk_index={chunk_idx}\n"
+                f"  First episode ({first_ep_idx}) has from_timestamp={first_from_ts:.2f}s\n"
+                f"  Expected from_timestamp < {tolerance}s (timestamps should reset per video file).\n"
+                f"  This indicates cumulative timestamps that weren't properly reset."
+            )
+
+    logging.debug(f"✓ {video_key}: timestamps correctly reset per file_index")
+
+
 def realign_parquets_to_videos(
     dataset: LeRobotDataset,
     output_dir: str | Path | None = None,
@@ -450,11 +503,14 @@ def realign_parquets_to_videos(
     WITHOUT re-encoding videos. It:
     1. Optionally copies videos as-is (no re-encoding)
     2. Reads video metadata from the source dataset
-    3. Rewrites data parquet files aligned with video files
-    4. Rewrites episode metadata parquet files aligned with video files
+    3. Ensures timestamps are correctly relative to each video file
+    4. Rewrites data parquet files aligned with a reference video key's structure
+    5. Rewrites episode metadata parquet files with correct per-video-key timestamps
 
-    This is useful when you have a dataset where the parquet files don't match
-    the video file structure and you want to optimize for streaming.
+    Note: Different video keys MAY have different file boundaries (split at different
+    episodes). This is valid - each video key's timestamps are relative to its own
+    video files. The data/episode parquets are aligned with the first video key's
+    file structure.
 
     Args:
         dataset: The source LeRobotDataset.
@@ -496,6 +552,7 @@ def realign_parquets_to_videos(
     )
 
     # Copy videos and build video metadata from source
+    # Each video key maintains its own file structure and timestamps
     video_metadata: dict[int, dict] = {i: {} for i in range(dataset.meta.total_episodes)}
 
     for video_key in dataset.meta.video_keys:
@@ -503,6 +560,10 @@ def realign_parquets_to_videos(
 
         # Track which video files we've copied
         copied_files: set[tuple[int, int]] = set()
+
+        # Track base timestamps for each video file to compute relative offsets
+        # Key: (chunk_idx, file_idx) -> first from_timestamp seen in that video file
+        video_file_base_timestamps: dict[tuple[int, int], float] = {}
 
         for ep_idx in range(dataset.meta.total_episodes):
             src_ep = dataset.meta.episodes[ep_idx]
@@ -526,17 +587,32 @@ def realign_parquets_to_videos(
                 shutil.copy(src_path, dst_path)
                 copied_files.add(file_key)
 
-            # Store video metadata (same as source)
+            # Track the base timestamp for each video file
+            # The first episode's from_timestamp becomes the base offset for that video file
+            if file_key not in video_file_base_timestamps:
+                video_file_base_timestamps[file_key] = from_ts
+
+            # Compute timestamps RELATIVE to this video file's start
+            # This ensures from_timestamp resets when file_index changes
+            base_ts = video_file_base_timestamps[file_key]
+            relative_from_ts = from_ts - base_ts
+            relative_to_ts = to_ts - base_ts
+
+            # Store video metadata with corrected relative timestamps
             video_metadata[ep_idx][f"videos/{video_key}/chunk_index"] = chunk_idx
             video_metadata[ep_idx][f"videos/{video_key}/file_index"] = file_idx
-            video_metadata[ep_idx][f"videos/{video_key}/from_timestamp"] = from_ts
-            video_metadata[ep_idx][f"videos/{video_key}/to_timestamp"] = to_ts
+            video_metadata[ep_idx][f"videos/{video_key}/from_timestamp"] = relative_from_ts
+            video_metadata[ep_idx][f"videos/{video_key}/to_timestamp"] = relative_to_ts
 
         # Update video info in metadata
         if video_key in dataset.meta.features and dataset.meta.features[video_key].get("info"):
             new_meta.info["features"][video_key]["info"] = dataset.meta.features[video_key]["info"]
 
+        # Validate that timestamps correctly reset per video file
+        _validate_video_timestamps_per_file(video_metadata, video_key, dataset.meta.total_episodes)
+
     # Copy and reindex parquet data files aligned with video files
+    # Uses the FIRST video key's file structure as reference for data parquet alignment
     logging.info("Writing data parquets aligned with videos...")
     data_metadata = _copy_and_reindex_data_aligned_with_videos(
         dataset, new_meta, episode_mapping, video_metadata
